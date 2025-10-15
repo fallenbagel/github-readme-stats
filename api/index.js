@@ -48,6 +48,9 @@ export default async (req, res) => {
     border_color,
     rank_icon,
     show,
+    include_private,
+    org_name,
+    org_repos,
   } = req.query;
   res.setHeader("Content-Type", "image/svg+xml");
 
@@ -94,6 +97,9 @@ export default async (req, res) => {
       showStats.includes("discussions_started"),
       showStats.includes("discussions_answered"),
       parseInt(commits_year, 10),
+      parseBoolean(include_private),
+      org_name,
+      parseArray(org_repos),
     );
     const cacheSeconds = resolveCacheSeconds({
       requested: parseInt(cache_seconds, 10),

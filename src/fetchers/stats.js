@@ -14,37 +14,61 @@ import { request } from "../common/http.js";
 dotenv.config();
 
 // GraphQL queries.
-const GRAPHQL_REPOS_FIELD = `
-  repositories(first: 100, ownerAffiliations: OWNER, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
-    totalCount
-    nodes {
-      name
-      stargazers {
+const GRAPHQL_REPOS_QUERY = `
+  query userInfo($login: String!, $after: String, $includePrivate: Boolean!, $includeOrg: Boolean!, $orgLogin: String, $orgAfter: String) {
+    user(login: $login) {
+      repositories(first: 100, ownerAffiliations: OWNER, isFork: false, privacy: PUBLIC, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) @skip(if: $includePrivate) {
         totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+      privateRepos: repositories(first: 100, ownerAffiliations: OWNER, isFork: false, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) @include(if: $includePrivate) {
+        totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-  }
-`;
-
-const GRAPHQL_REPOS_QUERY = `
-  query userInfo($login: String!, $after: String) {
-    user(login: $login) {
-      ${GRAPHQL_REPOS_FIELD}
+    organization(login: $orgLogin) @include(if: $includeOrg) {
+      repositories(first: 100, orderBy: {direction: DESC, field: STARGAZERS}, after: $orgAfter) {
+        totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
     }
   }
 `;
 
 const GRAPHQL_STATS_QUERY = `
-  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
+  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null, $includePrivate: Boolean!, $includeOrg: Boolean!, $orgLogin: String = "", $orgAfter: String) {
     user(login: $login) {
       name
       login
       commits: contributionsCollection (from: $startTime) {
-        totalCommitContributions,
+        totalCommitContributions
       }
       reviews: contributionsCollection {
         totalPullRequestReviewContributions
@@ -73,7 +97,47 @@ const GRAPHQL_STATS_QUERY = `
       repositoryDiscussionComments(onlyAnswers: true) @include(if: $includeDiscussionsAnswers) {
         totalCount
       }
-      ${GRAPHQL_REPOS_FIELD}
+      repositories(first: 100, ownerAffiliations: OWNER, isFork: false, privacy: PUBLIC, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) @skip(if: $includePrivate) {
+        totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+      privateRepos: repositories(first: 100, ownerAffiliations: OWNER, isFork: false, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) @include(if: $includePrivate) {
+        totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+    organization(login: $orgLogin) @include(if: $includeOrg) {
+      repositories(first: 100, orderBy: {direction: DESC, field: STARGAZERS}, after: $orgAfter) {
+        totalCount
+        nodes {
+          name
+          stargazers {
+            totalCount
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
     }
   }
 `;
@@ -81,7 +145,7 @@ const GRAPHQL_STATS_QUERY = `
 /**
  * Stats fetcher object.
  *
- * @param {object & { after: string | null }} variables Fetcher variables.
+ * @param {object & { after: string | null, includePrivate: boolean, orgLogin: string | null, orgAfter: string | null }} variables Fetcher variables.
  * @param {string} token GitHub token.
  * @returns {Promise<import('axios').AxiosResponse>} Axios response.
  */
@@ -117,10 +181,14 @@ const statsFetcher = async ({
   includeDiscussions,
   includeDiscussionsAnswers,
   startTime,
+  includePrivate = false,
+  orgName,
 }) => {
   let stats;
   let hasNextPage = true;
   let endCursor = null;
+  let orgEndCursor = null;
+
   while (hasNextPage) {
     const variables = {
       login: username,
@@ -130,6 +198,10 @@ const statsFetcher = async ({
       includeDiscussions,
       includeDiscussionsAnswers,
       startTime,
+      includePrivate,
+      includeOrg: !!orgName,
+      orgLogin: orgName || "",
+      orgAfter: orgEndCursor,
     };
     let res = await retryer(fetcher, variables);
     if (res.data.errors) {
@@ -137,22 +209,41 @@ const statsFetcher = async ({
     }
 
     // Store stats data.
-    const repoNodes = res.data.data.user.repositories.nodes;
+    const repoNodes = includePrivate
+      ? res.data.data.user.privateRepos.nodes
+      : res.data.data.user.repositories.nodes;
+
+    // Add org repos if available
+    const orgRepoNodes = res.data.data.organization?.repositories?.nodes || [];
+
     if (stats) {
-      stats.data.data.user.repositories.nodes.push(...repoNodes);
+      const targetField = includePrivate ? "privateRepos" : "repositories";
+      stats.data.data.user[targetField].nodes.push(...repoNodes);
+      if (orgRepoNodes.length > 0) {
+        stats.data.data.orgRepositories = stats.data.data.orgRepositories || {
+          nodes: [],
+        };
+        stats.data.data.orgRepositories.nodes.push(...orgRepoNodes);
+      }
     } else {
       stats = res;
+      if (orgRepoNodes.length > 0) {
+        stats.data.data.orgRepositories = { nodes: orgRepoNodes };
+      }
     }
 
-    // Disable multi page fetching on public Vercel instance due to rate limits.
     const repoNodesWithStars = repoNodes.filter(
       (node) => node.stargazers.totalCount !== 0,
     );
     hasNextPage =
       process.env.FETCH_MULTI_PAGE_STARS === "true" &&
       repoNodes.length === repoNodesWithStars.length &&
-      res.data.data.user.repositories.pageInfo.hasNextPage;
-    endCursor = res.data.data.user.repositories.pageInfo.endCursor;
+      (includePrivate
+        ? res.data.data.user.privateRepos.pageInfo.hasNextPage
+        : res.data.data.user.repositories.pageInfo.hasNextPage);
+    endCursor = includePrivate
+      ? res.data.data.user.privateRepos.pageInfo.endCursor
+      : res.data.data.user.repositories.pageInfo.endCursor;
   }
 
   return stats;
@@ -232,6 +323,9 @@ const fetchStats = async (
   include_discussions = false,
   include_discussions_answers = false,
   commits_year,
+  include_private = false,
+  orgName,
+  org_repos = [],
 ) => {
   if (!username) {
     throw new MissingParamError(["username"]);
@@ -258,6 +352,8 @@ const fetchStats = async (
     includeDiscussions: include_discussions,
     includeDiscussionsAnswers: include_discussions_answers,
     startTime: commits_year ? `${commits_year}-01-01T00:00:00Z` : undefined,
+    includePrivate: include_private,
+    orgName,
   });
 
   // Catch GraphQL errors.
@@ -314,7 +410,20 @@ const fetchStats = async (
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
   let repoToHide = new Set(allExcludedRepos);
 
-  stats.totalStars = user.repositories.nodes
+  const userRepos = include_private
+    ? user.privateRepos.nodes
+    : user.repositories.nodes;
+
+  let orgRepos = res.data.data.orgRepositories?.nodes || [];
+
+  if (org_repos && org_repos.length > 0) {
+    const orgRepoSet = new Set(org_repos);
+    orgRepos = orgRepos.filter((repo) => orgRepoSet.has(repo.name));
+  }
+
+  const allRepos = [...userRepos, ...orgRepos];
+
+  stats.totalStars = allRepos
     .filter((data) => {
       return !repoToHide.has(data.name);
     })
@@ -322,13 +431,18 @@ const fetchStats = async (
       return prev + curr.stargazers.totalCount;
     }, 0);
 
+  // Calculate total repo count
+  const totalRepoCount = include_private
+    ? user.privateRepos.totalCount
+    : user.repositories.totalCount;
+
   stats.rank = calculateRank({
     all_commits: include_all_commits,
     commits: stats.totalCommits,
     prs: stats.totalPRs,
     reviews: stats.totalReviews,
     issues: stats.totalIssues,
-    repos: user.repositories.totalCount,
+    repos: totalRepoCount + orgRepos.length,
     stars: stats.totalStars,
     followers: user.followers.totalCount,
   });

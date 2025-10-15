@@ -15,12 +15,10 @@ import { request } from "../common/http.js";
  * @returns {Promise<import("axios").AxiosResponse>} Languages fetcher response.
  */
 const fetcher = (variables, token) => {
-  return request(
-    {
-      query: `
-      query userInfo($login: String!) {
+  const query = variables.includePrivate
+    ? `
+  query userInfo($login: String!, $includeOrg: Boolean!, $orgLogin: String = "") {
         user(login: $login) {
-          # fetch only owner repos & not forks
           repositories(ownerAffiliations: OWNER, isFork: false, first: 100) {
             nodes {
               name
@@ -36,8 +34,64 @@ const fetcher = (variables, token) => {
             }
           }
         }
+        organization(login: $orgLogin) @include(if: $includeOrg) {
+          repositories(first: 100) {
+            nodes {
+              name
+              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                edges {
+                  size
+                  node {
+                    color
+                    name
+                  }
+                }
+              }
+            }
+          }
+        }
       }
-      `,
+      `
+    : `
+      query userInfo($login: String!, $includeOrg: Boolean!, $orgLogin: String = "") {
+        user(login: $login) {
+          repositories(ownerAffiliations: OWNER, isFork: false, privacy: PUBLIC, first: 100) {
+            nodes {
+              name
+              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                edges {
+                  size
+                  node {
+                    color
+                    name
+                  }
+                }
+              }
+            }
+          }
+        }
+        organization(login: $orgLogin) @include(if: $includeOrg) {
+          repositories(first: 100) {
+            nodes {
+              name
+              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                edges {
+                  size
+                  node {
+                    color
+                    name
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      `;
+
+  return request(
+    {
+      query,
       variables,
     },
     {
@@ -64,12 +118,20 @@ const fetchTopLanguages = async (
   exclude_repo = [],
   size_weight = 1,
   count_weight = 0,
+  include_private = false,
+  org_name,
+  org_repos = [],
 ) => {
   if (!username) {
     throw new MissingParamError(["username"]);
   }
 
-  const res = await retryer(fetcher, { login: username });
+  const res = await retryer(fetcher, {
+    login: username,
+    includePrivate: include_private,
+    includeOrg: !!org_name,
+    orgLogin: org_name || "",
+  });
 
   if (res.data.errors) {
     logger.error(res.data.errors);
@@ -92,6 +154,15 @@ const fetchTopLanguages = async (
   }
 
   let repoNodes = res.data.data.user.repositories.nodes;
+  let orgRepoNodes = res.data.data.organization?.repositories?.nodes || [];
+
+  if (org_repos && org_repos.length > 0) {
+    const orgRepoSet = new Set(org_repos);
+    orgRepoNodes = orgRepoNodes.filter((repo) => orgRepoSet.has(repo.name));
+  }
+
+  repoNodes = [...repoNodes, ...orgRepoNodes];
+
   /** @type {Record<string, boolean>} */
   let repoToHide = {};
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
@@ -105,11 +176,7 @@ const fetchTopLanguages = async (
   }
 
   // filter out repositories to be hidden
-  repoNodes = repoNodes
-    .sort((a, b) => b.size - a.size)
-    .filter((name) => !repoToHide[name.name]);
-
-  let repoCount = 0;
+  repoNodes = repoNodes.filter((repo) => !repoToHide[repo.name]);
 
   repoNodes = repoNodes
     .filter((node) => node.languages.edges.length > 0)
@@ -119,17 +186,16 @@ const fetchTopLanguages = async (
       // get the size of the language (bytes)
       let langSize = prev.size;
 
+      let repoCount = 1;
+
       // if we already have the language in the accumulator
       // & the current language name is same as previous name
       // add the size to the language size and increase repoCount.
       if (acc[prev.node.name] && prev.node.name === acc[prev.node.name].name) {
         langSize = prev.size + acc[prev.node.name].size;
-        repoCount += 1;
-      } else {
-        // reset repoCount to 1
-        // language must exist in at least one repo to be detected
-        repoCount = 1;
+        repoCount = acc[prev.node.name].count + 1;
       }
+
       return {
         ...acc,
         [prev.node.name]: {
